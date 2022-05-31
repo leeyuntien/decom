@@ -94,6 +94,7 @@ end
 struct FMPredictor{T<:PredictorTask}
     task::T
     model::FMModel
+    model_Δ::FMModel
 end
 
 struct SGDMethod <: MethodParams
@@ -148,12 +149,13 @@ function initModel(params::GaussianModelParams, X::SparseMatrixCSC, y::Vector{Fl
     b = .0
     u = zeros(num_attributes)
     V = randn(num_attributes, params.num_factors) .* params.σ .+ params.μ
-    #=b = 0.2098
+    b = 0.2098
     u = [0.3174; 0.3704; -0.2549]
-    V = [0.0461 0.4024; -1.0115 0.2167; -0.6123  0.5036]=#
+    V = [0.0461 0.4024; -1.0115 0.2167; -0.6123  0.5036]
 
     # new model
-    FMModel(params.k₀, params.k₁, b, u, V, params.num_factors)
+    # return (FMModel(params.k₀, params.k₁, b, u, V, params.num_factors), FMModel(params.k₀, params.k₁, b, u, zeros(num_attributes, params.num_factors), params.num_factors))
+    return (FMModel(params.k₀, params.k₁, b, u, V, params.num_factors), FMModel(params.k₀, params.k₁, 0, zeros(num_attributes), zeros(num_attributes, params.num_factors), params.num_factors))
 end
 
 """
@@ -211,26 +213,46 @@ function predict_instance!(predictor::FMPredictor,
 end
 
 function sgd_update!(
-    sgd::SGDMethod, model::FMModel,
+    sgd::SGDMethod, model::FMModel, model_Δ::FMModel,
     X::SparseMatrixCSC,
     total_losses::Array{Float64}, cross_terms::Matrix{Float64})
 
     if model.k₀
-        model.b -= sgd.α * (-sum(total_losses) / X.m + sgd.λ₀ * model.b)
+        curr = model.b
+        model.b -= sgd.α * (-sum(total_losses) / X.m + sgd.γ * model_Δ.b + sgd.λ₀ * model.b)
+        model_Δ.b = curr - model.b
     end
 
     if model.k₁
-        model.u .-= sgd.α .* (-X' * total_losses ./ X.m .+ sgd.λᵤ .* model.u)
+        curru = copy(model.u)
+        model.u .-= sgd.α .* (-X' * total_losses ./ X.m .+ sgd.γ * model_Δ.u .+ sgd.λᵤ .* model.u)
+        model_Δ.u = curru .- model.u
+        #=for i in 1:length(model.u)
+            curr = model.u[i]
+            model.u[i] -= sgd.α .* (-X[:, i]' * total_losses ./ X.m .+ sgd.γ * model_Δ.u[i] .+ sgd.λᵤ .* model.u[i])
+            model_Δ[i] = curr - model.u[i]
+        end=#
     end
 
     x_loss_terms = X .* total_losses ./ X.m
+    currV = copy(model.V)
     @inbounds for f in 1:model.num_factors
         Δ = zeros(X.n)
         @inbounds for i in 1:X.n # cross_terms = X * model.V
             Δ[i] = dot(cross_terms[:, f] .- X[:, i] .* model.V[i, f], -x_loss_terms[:, i])
         end
-        model.V[:, f] .-= sgd.α .* (Δ .+ sgd.λᵥ .* model.V[:, f])
+        model.V[:, f] .-= sgd.α .* (Δ .+ sgd.γ * model_Δ.V[:, f] .+ sgd.λᵥ .* model.V[:, f])
     end
+    model_Δ.V = currV .- model.V
+    #=@inbounds for f in 1:model.num_factors
+        currV = model.V[:, f]
+        Δ = zeros(X.n)
+        @inbounds for i in 1:X.n # cross_terms = X * model.V
+            Δ[i] = dot(cross_terms[:, f] .- X[:, i] .* model.V[i, f], -x_loss_terms[:, i])
+        end
+        model.V[:, f] .-= sgd.α .* (Δ .+ sgd.γ * model_Δ.V[:, f] .+ sgd.λᵥ .* model.V[:, f])
+        model_Δ.V[:, f] = currV .- model.V[:, f]
+    end=#
 end
 
 function sgd_epoch!(
@@ -247,10 +269,11 @@ function sgd_epoch!(
         total_losses[c] = loss_deriv(predictor.task, predictions[c], y[c])
         #@show "DEBUG: total loss: $total_losses[c]"
     end=#
-    predictions = sigmoid.(-predictor.model.b .- X * predictor.model.u .- sum(cross_terms .^ 2 .- X.^2 * model.V.^2, dims = 2) ./ 2)
+    cross_terms = X * predictor.model.V
+    predictions = sigmoid.(-predictor.model.b .- X * predictor.model.u .- sum(cross_terms .^ 2 .- X.^2 * predictor.model.V.^2, dims = 2) ./ 2)
     total_losses = loss_deriv.(fill(predictor.task, X.m), predictions, y)
     # batch update
-    sgd_update!(sgd, predictor.model, X, total_losses, X * predictor.model.V)
+    sgd_update!(sgd, predictor.model, predictor.model_Δ, X, total_losses, cross_terms)
     #evaluation
     # @time evaluation = evaluate!(evaluator, predictor, X, y, predictions)
     # err = [sqerr(predictions[i], y[i]) for i in 1:length(y)]
@@ -278,9 +301,9 @@ function train(X::SparseMatrixCSC, y::Vector{Float64};
     task_params::TaskParams   = classification(),
     model_params::ModelParams = gauss(k₀ = true, k₁ = true, num_factors = 2, μ = .0, σ = 1.0))
 
-    model = @time initModel(model_params, X, y)
+    (model, model_Δ) = @time initModel(model_params, X, y)    
     task = @time initTask(task_params, X, y)
-    predictor = @time FMPredictor(task, model)
+    predictor = @time FMPredictor(task, model, model_Δ)
 
     # Train the predictor using SGD
     sgd_train!(method, evaluator, predictor, X, y)
