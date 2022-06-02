@@ -369,7 +369,7 @@ function train_fold(X::SparseMatrixCSC, y::Vector{Float64};
             sgd_update!(sgd, predictor.model, predictor.model_Δ, X_train, total_losses, cross_terms)
             #evaluation
             predictions = sigmoid.(-predictor.model.b .- X_valid * predictor.model.u .- sum(cross_terms .^ 2 .- X_valid.^2 * predictor.model.V.^2, dims = 2) ./ 2)
-            evaluation = roc_auc(y_valid, predictions)
+            evaluation, _, _ = roc_auc(y_valid, predictions)
             if evaluation > best_auc
                 best_predictor = copy(predictor)
                 best_auc = evaluation
