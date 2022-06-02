@@ -2,6 +2,7 @@ using SparseArrays
 using Statistics
 using Random
 using LinearAlgebra
+using MLDataUtils
 
 abstract type MethodParams
 end
@@ -136,6 +137,37 @@ function read_libsvm(fname::String, dimension = :col)
     else
         (sparse(mJ,mI,mV), label)
     end
+end
+
+function roc_auc(y, y′, intervals = 100)
+    @assert length(y) == length(y′)
+
+    auc = 0.0
+    TPR, FPR = zeros(Float64, intervals), zeros(Float64, intervals)
+    for i in 1:intervals
+        TP, FN, FP, TN = 0, 0, 0, 0
+        for j in 1:length(y)
+            if y[j] > 0 # must be either 0 or 1
+                if y′[j] >= i / intervals # sigmoid within 0 and 1
+                    TP += 1
+                else
+                    FN += 1
+                end
+            else
+                if y′[j] >= i / intervals
+                    FP += 1
+                else
+                    TN += 1
+                end
+            end
+        end
+        TPR[i] = TP / (TP + FN)
+        FPR[i] = FP / (TN + FP)
+        if i > 1
+            auc += (FPR[i - 1] - FPR[i]) * (TPR[i] + TPR[i - 1]) / 2
+        end
+    end
+    auc, TPR, FPR
 end
 
 function initModel(params::GaussianModelParams, X::SparseMatrixCSC, y::Vector{Float64})
@@ -311,6 +343,46 @@ function train(X::SparseMatrixCSC, y::Vector{Float64};
     predictor
 end
 
+function train_fold(X::SparseMatrixCSC, y::Vector{Float64};
+    method::SGDMethod         = sgd(α = 1.0, γ = 1.0, num_epochs = 3, λ₀ = .0, λᵤ = .0, λᵥ = .0),
+    evaluator::Evaluator      = rmse(),
+    task_params::TaskParams   = classification(),
+    model_params::ModelParams = gauss(k₀ = true, k₁ = true, num_factors = 2, μ = .0, σ = 1.0),
+    kₙ::Integer = 3)
+
+    (model, model_Δ) = @time initModel(model_params, X, y)    
+    task = @time initTask(task_params, X, y)
+    predictor = @time FMPredictor(task, model, model_Δ)
+    best_predictor = copy(predictor)
+    best_auc = -Inf
+
+    # Train the predictor using SGD
+    kfds = kfolds(1:X.m, k = kₙ)
+    for fd in 1:kₙ
+        X_train, X_valid, y_train, y_valid = X[kfds[fd][1], :], X[kfds[fd][2], :], y[kfds[fd][1]], X[kfds[fd][2]]
+        for epoch in 1:sgd.num_epochs
+            #@show "[SGD - Epoch $epoch] Start..."
+            cross_terms = X_train * predictor.model.V
+            predictions = sigmoid.(-predictor.model.b .- X_train * predictor.model.u .- sum(cross_terms .^ 2 .- X_train.^2 * predictor.model.V.^2, dims = 2) ./ 2)
+            total_losses = loss_deriv.(fill(predictor.task, X_train.m), predictions, y_train)
+            # batch update
+            sgd_update!(sgd, predictor.model, predictor.model_Δ, X_train, total_losses, cross_terms)
+            #evaluation
+            predictions = sigmoid.(-predictor.model.b .- X_valid * predictor.model.u .- sum(cross_terms .^ 2 .- X_valid.^2 * predictor.model.V.^2, dims = 2) ./ 2)
+            evaluation = roc_auc(y_valid, predictions)
+            if evaluation > best_auc
+                best_predictor = copy(predictor)
+                best_auc = evaluation
+            end
+            @show "[SGD - Epoch $epoch] Evaluation: $evaluation"        
+            #@show "[SGD - Epoch $epoch] End."
+        end
+    end
+
+    predictor
+end
+
 X = sparse([2.0 1.0 3.0; 1.0 1.0 1.0; 1.0 1.0 1.0; 1.0 1.0 1.0])
 y = [1.0; 2.0; 3.0; 4.0]
 train(X, y)
+
