@@ -353,25 +353,25 @@ function train_fold(X::SparseMatrixCSC, y::Vector{Float64};
     (model, model_Δ) = @time initModel(model_params, X, y)    
     task = @time initTask(task_params, X, y)
     predictor = @time FMPredictor(task, model, model_Δ)
-    best_predictor = copy(predictor)
+    best_predictor = deepcopy(predictor)
     best_auc = -Inf
 
     # Train the predictor using SGD
     kfds = kfolds(1:X.m, k = kₙ)
     for fd in 1:kₙ
         X_train, X_valid, y_train, y_valid = X[kfds[fd][1], :], X[kfds[fd][2], :], y[kfds[fd][1]], X[kfds[fd][2]]
-        for epoch in 1:sgd.num_epochs
+        for epoch in 1:method.num_epochs
             #@show "[SGD - Epoch $epoch] Start..."
             cross_terms = X_train * predictor.model.V
             predictions = sigmoid.(-predictor.model.b .- X_train * predictor.model.u .- sum(cross_terms .^ 2 .- X_train.^2 * predictor.model.V.^2, dims = 2) ./ 2)
             total_losses = loss_deriv.(fill(predictor.task, X_train.m), predictions, y_train)
             # batch update
-            sgd_update!(sgd, predictor.model, predictor.model_Δ, X_train, total_losses, cross_terms)
+            sgd_update!(method, predictor.model, predictor.model_Δ, X_train, total_losses, cross_terms)
             #evaluation
-            predictions = sigmoid.(-predictor.model.b .- X_valid * predictor.model.u .- sum(cross_terms .^ 2 .- X_valid.^2 * predictor.model.V.^2, dims = 2) ./ 2)
+            predictions = sigmoid.(-predictor.model.b .- X_valid * predictor.model.u .- sum((X_valid * predictor.model.V) .^ 2 .- X_valid.^2 * predictor.model.V.^2, dims = 2) ./ 2)
             evaluation, _, _ = roc_auc(y_valid, predictions)
             if evaluation > best_auc
-                best_predictor = copy(predictor)
+                best_predictor = deepcopy(predictor)
                 best_auc = evaluation
             end
             @show "[SGD - Epoch $epoch] Evaluation: $evaluation"        
