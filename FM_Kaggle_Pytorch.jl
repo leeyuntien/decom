@@ -1,22 +1,26 @@
 using SparseArrays
 using Statistics
 using Random
-using LinearAlgebra
+using Distributed
 using MLDataUtils
+using PyCall
 
-abstract type MethodParams
+addprocs(4)
+@everywhere using LinearAlgebra
+
+@everywhere abstract type MethodParams
 end
 
-abstract type Evaluator
+@everywhere abstract type Evaluator
 end
 
-abstract type ModelParams
+@everywhere abstract type ModelParams
 end
 
-abstract type TaskParams
+@everywhere abstract type TaskParams
 end
 
-struct SquaredErrorEvaluator <: Evaluator
+@everywhere struct SquaredErrorEvaluator <: Evaluator
     stat::Function
     SquaredErrorEvaluator(; stat::Function = x -> sqrt(mean(x))) = new(stat)
 end
@@ -40,28 +44,28 @@ nlogsig_deriv(p::Number, y::Number) = y * sigmoid(p * y) - y
 bce(sp::Number, y::Number) = -y * log(sp) - (1 - y) * (sp > (1 - 10e-9) ? 10e-9 : log(1 - sp))
 bce_deriv(sp::Number, y::Number) = sp - (1 - y)
 
-"""Represents a classification task"""
-struct ClassificationTaskParams <: TaskParams
+#"""Represents a classification task"""
+@everywhere struct ClassificationTaskParams <: TaskParams
 end
-const classification = ClassificationTaskParams
+@everywhere const classification = ClassificationTaskParams
 
-"""Represents a regression task"""
-struct RegressionTaskParams <: TaskParams
+#"""Represents a regression task"""
+@everywhere struct RegressionTaskParams <: TaskParams
 end
-const regression = RegressionTaskParams
+@everywhere const regression = RegressionTaskParams
 
-abstract type PredictorTask
+@everywhere abstract type PredictorTask
 end
 
-"""Classification parameters derived from data"""
-struct ClassificationTask <: PredictorTask
+#"""Classification parameters derived from data"""
+@everywhere struct ClassificationTask <: PredictorTask
 end
 
 loss(::ClassificationTask, p::Number, y::Number)       = bce(p, y)
 loss_deriv(::ClassificationTask, p::Number, y::Number) = bce_deriv(p, y)
 
-"""Regression parameters derived from data"""
-struct RegressionTask <: PredictorTask
+#"""Regression parameters derived from data"""
+@everywhere struct RegressionTask <: PredictorTask
     target_min::Float64
     target_max::Float64
 
@@ -72,7 +76,7 @@ end
 loss(::RegressionTask, p::Number, y::Number)       = sqerr(p, y)
 loss_deriv(::RegressionTask, p::Number, y::Number) = sqerr_deriv(p, y)
 
-mutable struct GaussianModelParams <: ModelParams
+@everywhere mutable struct GaussianModelParams <: ModelParams
     k₀::Bool
     k₁::Bool
     num_factors::Int64
@@ -83,7 +87,7 @@ mutable struct GaussianModelParams <: ModelParams
 end
 const gauss = GaussianModelParams
 
-mutable struct FMModel
+@everywhere mutable struct FMModel
     k₀::Bool
     k₁::Bool
     b::Float64
@@ -92,7 +96,7 @@ mutable struct FMModel
     num_factors::Int64
 end
 
-struct FMPredictor{T<:PredictorTask}
+@everywhere struct FMPredictor{T<:PredictorTask}
     task::T
     model::FMModel
     model_Δ::FMModel
@@ -181,9 +185,9 @@ function initModel(params::GaussianModelParams, X::SparseMatrixCSC, y::Vector{Fl
     b = .0
     u = zeros(num_attributes)
     V = randn(num_attributes, params.num_factors) .* params.σ .+ params.μ
-    b = 0.2098
+    #=b = 0.2098
     u = [0.3174; 0.3704; -0.2549]
-    V = [0.0461 0.4024; -1.0115 0.2167; -0.6123  0.5036]
+    V = [0.0461 0.4024; -1.0115 0.2167; -0.6123  0.5036]=#
 
     # new model
     # return (FMModel(params.k₀, params.k₁, b, u, V, params.num_factors), FMModel(params.k₀, params.k₁, b, u, zeros(num_attributes, params.num_factors), params.num_factors))
@@ -253,6 +257,7 @@ function sgd_update!(
         curr = model.b
         model.b -= sgd.α * (-sum(total_losses) / X.m + sgd.γ * model_Δ.b + sgd.λ₀ * model.b)
         model_Δ.b = curr - model.b
+        @show "b updated"
     end
 
     if model.k₁
@@ -264,17 +269,37 @@ function sgd_update!(
             model.u[i] -= sgd.α .* (-X[:, i]' * total_losses ./ X.m .+ sgd.γ * model_Δ.u[i] .+ sgd.λᵤ .* model.u[i])
             model_Δ[i] = curr - model.u[i]
         end=#
+        @show "u updated"
     end
 
-    x_loss_terms = X .* total_losses ./ X.m
-    currV = copy(model.V)
-    @inbounds for f in 1:model.num_factors
-        Δ = zeros(X.n)
-        @inbounds for i in 1:X.n # cross_terms = X * model.V
-            Δ[i] = dot(cross_terms[:, f] .- X[:, i] .* model.V[i, f], -x_loss_terms[:, i])
-        end
-        model.V[:, f] .-= sgd.α .* (Δ .+ sgd.γ * model_Δ.V[:, f] .+ sgd.λᵥ .* model.V[:, f])
+    #x_loss_terms = X .* total_losses ./ X.m
+    xlv = zeros(nnz(X))
+    xxl = zeros(X.n)
+    # update whole matrix slower due to more allocated memory
+    # xxlv = zeros(X.n, model.num_factors)
+    xnz = findnz(X)
+    @time for i in 1:nnz(X)
+        xlv[i] = X[xnz[1][i], xnz[2][i]] * total_losses[xnz[1][i]] / X.m
+        xxl[xnz[2][i]] += X[xnz[1][i], xnz[2][i]] * X[xnz[1][i], xnz[2][i]] * total_losses[xnz[1][i]] / X.m
+        # update whole matrix slower due to more allocated memory
+        #=for j in 1:model.num_factors
+            xxlv[xnz[2][i], j] += X[xnz[1][i], xnz[2][i]] * X[xnz[1][i], xnz[2][i]] * total_losses[xnz[1][i]] / X.m * model.V[xnz[2][i], j]
+        end=#
     end
+    x_loss = sparse(xnz[1], xnz[2], xlv)
+    currV = copy(model.V)
+    xvxl = x_loss' * cross_terms
+    @inbounds for f in 1:model.num_factors
+        #Δ = zeros(X.n)
+        @time @inbounds for i in 1:X.n # cross_terms = X * model.V
+            #Δ[i] = dot(cross_terms[:, f] .- X[:, i] .* model.V[i, f], -x_loss_terms[:, i])
+            #Δ[i] = dot(cross_terms[:, f] .- Array(X[:, i] .* model.V[i, f]), Array(-X[:, i] .* total_losses ./ X.m))
+            model.V[i, f] -= sgd.α * ((xvxl[i, f] - xxl[i] * model.V[i, f]) + sgd.γ * model_Δ.V[i, f] + sgd.λᵥ * model.V[i, f])
+        end
+        #model.V[:, f] .-= sgd.α .* (Δ .+ sgd.γ .* model_Δ.V[:, f] .+ sgd.λᵥ .* model.V[:, f])
+    end
+    # update whole matrix slower due to more allocated memory
+    # model.V .-= sgd.α .* ((xvxl .- xxlv) .+ sgd.γ .* model_Δ.V .+ sgd.λᵥ .* model.V)
     model_Δ.V = currV .- model.V
     #=@inbounds for f in 1:model.num_factors
         currV = model.V[:, f]
@@ -285,6 +310,7 @@ function sgd_update!(
         model.V[:, f] .-= sgd.α .* (Δ .+ sgd.γ * model_Δ.V[:, f] .+ sgd.λᵥ .* model.V[:, f])
         model_Δ.V[:, f] = currV .- model.V[:, f]
     end=#
+    @show "V updated"
 end
 
 function sgd_epoch!(
@@ -344,15 +370,15 @@ function train(X::SparseMatrixCSC, y::Vector{Float64};
 end
 
 function train_fold(X::SparseMatrixCSC, y::Vector{Float64};
-    method::SGDMethod         = sgd(α = 1.0, γ = 1.0, num_epochs = 3, λ₀ = .0, λᵤ = .0, λᵥ = .0),
+    method::SGDMethod         = sgd(α = 1.0, γ = 1.0, num_epochs = 30, λ₀ = .0, λᵤ = .0, λᵥ = .0),
     evaluator::Evaluator      = rmse(),
     task_params::TaskParams   = classification(),
-    model_params::ModelParams = gauss(k₀ = true, k₁ = true, num_factors = 2, μ = .0, σ = 1.0),
+    model_params::ModelParams = gauss(k₀ = true, k₁ = true, num_factors = 5, μ = .0, σ = 1.0),
     kₙ::Integer = 3)
 
-    (model, model_Δ) = @time initModel(model_params, X, y)    
-    task = @time initTask(task_params, X, y)
-    predictor = @time FMPredictor(task, model, model_Δ)
+    (model, model_Δ) = initModel(model_params, X, y)    
+    task = initTask(task_params, X, y)
+    predictor = FMPredictor(task, model, model_Δ)
     best_predictor = deepcopy(predictor)
     best_auc = -Inf
 
@@ -361,7 +387,7 @@ function train_fold(X::SparseMatrixCSC, y::Vector{Float64};
     for fd in 1:kₙ
         X_train, X_valid, y_train, y_valid = X[kfds[fd][1], :], X[kfds[fd][2], :], y[kfds[fd][1]], X[kfds[fd][2]]
         for epoch in 1:method.num_epochs
-            #@show "[SGD - Epoch $epoch] Start..."
+            @show "[SGD - Epoch $epoch] Start..."
             cross_terms = X_train * predictor.model.V
             predictions = sigmoid.(-predictor.model.b .- X_train * predictor.model.u .- sum(cross_terms .^ 2 .- X_train.^2 * predictor.model.V.^2, dims = 2) ./ 2)
             total_losses = loss_deriv.(fill(predictor.task, X_train.m), predictions, y_train)
@@ -375,14 +401,22 @@ function train_fold(X::SparseMatrixCSC, y::Vector{Float64};
                 best_auc = evaluation
             end
             @show "[SGD - Epoch $epoch] Evaluation: $evaluation"        
-            #@show "[SGD - Epoch $epoch] End."
+            @show "[SGD - Epoch $epoch] End."
         end
     end
 
     predictor
 end
 
-X = sparse([2.0 1.0 3.0; 1.0 1.0 1.0; 1.0 1.0 1.0; 1.0 1.0 1.0])
+#=X = sparse([2.0 1.0 3.0; 1.0 1.0 1.0; 1.0 1.0 1.0; 1.0 1.0 1.0])
 y = [1.0; 2.0; 3.0; 4.0]
-train(X, y)
+train(X, y)=#
 
+#X, y = read_libsvm("C:/Users/user/OneDrive/Documents/languages/Julia/jl/FM/df_fm_n101847.libsvm", :row)
+@pyimport pickle
+f = py"""open("data/df_fm_csr.pickle", "rb")"""
+data = pickle.load(f, encoding = "latin1")
+w = sparse(data.nonzero()[1].+1, data.nonzero()[2].+1, data.data)
+X = hcat(w[:, 1:11], w[:, 13:end])
+y = Vector{Float64}(w[:, 12])
+train_fold(X, y)
