@@ -4,6 +4,8 @@ using Random
 using Distributed
 using MLDataUtils
 using PyCall
+using CUDA
+using CUDA.CUSPARSE
 
 addprocs(4)
 @everywhere using LinearAlgebra
@@ -80,8 +82,8 @@ loss_deriv(::RegressionTask, p::Number, y::Number) = sqerr_deriv(p, y)
     k₀::Bool
     k₁::Bool
     num_factors::Int64
-    μ::Float64
-    σ::Float64
+    μ::Float32
+    σ::Float32
     GaussianModelParams(; k₀ = true, k₁ = true, num_factors = 8, μ = .0, σ = .01) =
         new(k₀, k₁, num_factors, μ, σ)
 end
@@ -90,9 +92,9 @@ const gauss = GaussianModelParams
 @everywhere mutable struct FMModel
     k₀::Bool
     k₁::Bool
-    b::Float64
-    u::Vector{Float64}
-    V::Matrix{Float64}
+    b::Float32
+    u::Vector{Float32}
+    V::Matrix{Float32}
     num_factors::Int64
 end
 
@@ -103,34 +105,34 @@ end
 end
 
 struct SGDMethod <: MethodParams
-    α::Float64 # learning rate
-    γ::Float64 # momentum
+    α::Float32 # learning rate
+    γ::Float32 # momentum
     num_epochs::Int64
     # regularization
-    λ₀::Float64
-    λᵤ::Float64
-    λᵥ::Float64
-    SGDMethod(; α::Float64 = 0.01, γ::Float64 = 0.9, num_epochs::Int64 = 100, λ₀::Float64 = .0, λᵤ::Float64 = .0, λᵥ::Float64 = .0) =
+    λ₀::Float32
+    λᵤ::Float32
+    λᵥ::Float32
+    SGDMethod(; α::Float32 = 0.01, γ::Float32 = 0.9, num_epochs::Int64 = 100, λ₀::Float32 = .0, λᵤ::Float32 = .0, λᵥ::Float32 = .0) =
         new(α, γ, num_epochs, λ₀, λᵤ, λᵥ)
 end
 const sgd = SGDMethod
 
 function read_libsvm(fname::String, dimension = :col)
-    label = Float64[]
+    label = Float32[]
     mI = Int64[]
     mJ = Int64[]
-    mV = Float64[]
+    mV = Float32[]
     fi = open(fname, "r")
     cnt = 1
     for line in eachline(fi)
         line = split(strip(line), " ")
-        push!(label, parse(Float64, line[1]))
+        push!(label, parse(Float32, line[1]))
         line = line[2:end]
         for itm in line
             itm = split(itm, ":")
             push!(mI, parse(Int, itm[1]) + 1)
             push!(mJ, cnt)
-            push!(mV, parse(Float64, itm[2]))
+            push!(mV, parse(Float32, itm[2]))
         end
         cnt += 1
     end
@@ -147,7 +149,7 @@ function roc_auc(y, y′, intervals = 100)
     @assert length(y) == length(y′)
 
     auc = 0.0
-    TPR, FPR = zeros(Float64, intervals), zeros(Float64, intervals)
+    TPR, FPR = zeros(Float32, intervals), zeros(Float32, intervals)
     for i in 1:intervals
         TP, FN, FP, TN = 0, 0, 0, 0
         for j in 1:length(y)
@@ -174,7 +176,7 @@ function roc_auc(y, y′, intervals = 100)
     auc, TPR, FPR
 end
 
-function initModel(params::GaussianModelParams, X::SparseMatrixCSC, y::Vector{Float64})
+function initModel(params::GaussianModelParams, X::SparseMatrixCSC, y::Vector{Float32})
     # initialization
     num_samples, num_attributes = size(X)
     # sanity check
@@ -197,24 +199,24 @@ end
 """
 Given data `X` and `y`, initializes a `ClassificationTask`
 """
-function initTask(::ClassificationTaskParams, X::SparseMatrixCSC, y::Vector{Float64})
+function initTask(::ClassificationTaskParams, X::SparseMatrixCSC, y::Vector{Float32})
     ClassificationTask()
 end
 
 """
 Given data `X` and `y`, initializes a `RegressionTask`
 """
-function initTask(::RegressionTaskParams, X::SparseMatrixCSC, y::Vector{Float64})
+function initTask(::RegressionTaskParams, X::SparseMatrixCSC, y::Vector{Float32})
     RegressionTask(target_min = minimum(y), target_max = maximum(y))
 end
 
 function predict_instance!(model::FMModel,
-    idx::StridedVector{Int64}, x::StridedVector{Float64},
-    f_sum::Vector{Float64}, sum_sqr::Vector{Float64})
+    idx::StridedVector{Int64}, x::StridedVector{Float32},
+    f_sum::Vector{Float32}, sum_sqr::Vector{Float32})
 
     fill!(f_sum, .0)
     fill!(sum_sqr, .0)
-    result = zero(Float64)
+    result = zero(Float32)
     if model.k₀
         result += model.b
     end
@@ -236,8 +238,8 @@ end
 
 """Instance prediction specialized for classification or regression"""
 function predict_instance!(predictor::FMPredictor,
-                           idx::StridedVector{Int64}, x::StridedVector{Float64},
-                           f_sum::Vector{Float64}, sum_sqr::Vector{Float64})
+                           idx::StridedVector{Int64}, x::StridedVector{Float32},
+                           f_sum::Vector{Float32}, sum_sqr::Vector{Float32})
 
     if typeof(predictor.task) == ClassificationTask
         p = predict_instance!(predictor.model, idx, x, f_sum, sum_sqr)
@@ -251,7 +253,7 @@ end
 function sgd_update!(
     sgd::SGDMethod, model::FMModel, model_Δ::FMModel,
     X::SparseMatrixCSC,
-    total_losses::Array{Float64}, cross_terms::Matrix{Float64})
+    total_losses::Array{Float32}, cross_terms::Matrix{Float32})
 
     if model.k₀
         curr = model.b
@@ -277,24 +279,28 @@ function sgd_update!(
     xxl = zeros(X.n)
     # update whole matrix slower due to more allocated memory
     # xxlv = zeros(X.n, model.num_factors)
-    xnz = findnz(X)
-    @time for i in 1:nnz(X)
-        xlv[i] = X[xnz[1][i], xnz[2][i]] * total_losses[xnz[1][i]] / X.m
-        xxl[xnz[2][i]] += X[xnz[1][i], xnz[2][i]] * X[xnz[1][i], xnz[2][i]] * total_losses[xnz[1][i]] / X.m
+    @time xnz = findnz(X)
+    #@time @sync @distributed for i in 1:nnz(X)
+    @time @inbounds for i in 1:nnz(X)
+        xlv[i] = xnz[3][i] * total_losses[xnz[1][i]] / X.m
+        #xlv[i] = X[xnz[1][i], xnz[2][i]] * total_losses[xnz[1][i]] / X.m
+        xxl[xnz[2][i]] += xnz[3][i] * xnz[3][i] * total_losses[xnz[1][i]] / X.m
+        #xxl[xnz[2][i]] += X[xnz[1][i], xnz[2][i]] * X[xnz[1][i], xnz[2][i]] * total_losses[xnz[1][i]] / X.m
         # update whole matrix slower due to more allocated memory
         #=for j in 1:model.num_factors
             xxlv[xnz[2][i], j] += X[xnz[1][i], xnz[2][i]] * X[xnz[1][i], xnz[2][i]] * total_losses[xnz[1][i]] / X.m * model.V[xnz[2][i], j]
         end=#
     end
-    x_loss = sparse(xnz[1], xnz[2], xlv)
+    @time x_loss = sparse(xnz[1], xnz[2], xlv) # cu(x_loss) too slow
     currV = copy(model.V)
-    xvxl = x_loss' * cross_terms
+    @time xvxl = x_loss' * cross_terms
     @inbounds for f in 1:model.num_factors
         #Δ = zeros(X.n)
         @time @inbounds for i in 1:X.n # cross_terms = X * model.V
             #Δ[i] = dot(cross_terms[:, f] .- X[:, i] .* model.V[i, f], -x_loss_terms[:, i])
             #Δ[i] = dot(cross_terms[:, f] .- Array(X[:, i] .* model.V[i, f]), Array(-X[:, i] .* total_losses ./ X.m))
             model.V[i, f] -= sgd.α * ((xvxl[i, f] - xxl[i] * model.V[i, f]) + sgd.γ * model_Δ.V[i, f] + sgd.λᵥ * model.V[i, f])
+            #model.V[i, f] -= sgd.α * ((dot(X[:, i] .* total_losses, cross_terms[:, f]) - xxl[i] * model.V[i, f]) + sgd.γ * model_Δ.V[i, f] + sgd.λᵥ * model.V[i, f])
         end
         #model.V[:, f] .-= sgd.α .* (Δ .+ sgd.γ .* model_Δ.V[:, f] .+ sgd.λᵥ .* model.V[:, f])
     end
@@ -315,9 +321,9 @@ end
 
 function sgd_epoch!(
     sgd::SGDMethod, evaluator::Evaluator, predictor::FMPredictor,
-    X::SparseMatrixCSC, y::StridedVector{Float64}, epoch::Int64)
+    X::SparseMatrixCSC, y::StridedVector{Float32}, epoch::Int64)
 
-    #=total_losses = zeros(Float64, X.n)
+    #=total_losses = zeros(Float32, X.n)
     for c in 1:X.n # X.n = size(y)[1] = number of data points
         X_nzrange = nzrange(X, c)
         x = X.nzval[X_nzrange]
@@ -342,7 +348,7 @@ end
 
 function sgd_train!(
     sgd::SGDMethod, evaluator::Evaluator, predictor::FMPredictor,
-    X::SparseMatrixCSC, y::StridedVector{Float64})
+    X::SparseMatrixCSC, y::StridedVector{Float32})
 
     @show "Learning Factorization Machines with gradient descent..."
     for epoch in 1:sgd.num_epochs
@@ -353,7 +359,7 @@ function sgd_train!(
     end
 end
 
-function train(X::SparseMatrixCSC, y::Vector{Float64};
+function train(X::SparseMatrixCSC, y::Vector{Float32};
     method::SGDMethod         = sgd(α = 1.0, γ = 1.0, num_epochs = 3, λ₀ = .0, λᵤ = .0, λᵥ = .0),
     evaluator::Evaluator      = rmse(),
     task_params::TaskParams   = classification(),
@@ -369,11 +375,11 @@ function train(X::SparseMatrixCSC, y::Vector{Float64};
     predictor
 end
 
-function train_fold(X::SparseMatrixCSC, y::Vector{Float64};
-    method::SGDMethod         = sgd(α = 1.0, γ = 1.0, num_epochs = 30, λ₀ = .0, λᵤ = .0, λᵥ = .0),
+function train_fold(X::SparseMatrixCSC, y::Vector{Float32};
+    method::SGDMethod         = sgd(α = Float32(1.0), γ = Float32(1.0), num_epochs = 30, λ₀ = Float32(.0), λᵤ = Float32(.0), λᵥ = Float32(.0)),
     evaluator::Evaluator      = rmse(),
     task_params::TaskParams   = classification(),
-    model_params::ModelParams = gauss(k₀ = true, k₁ = true, num_factors = 5, μ = .0, σ = 1.0),
+    model_params::ModelParams = gauss(k₀ = true, k₁ = true, num_factors = 5, μ = Float32(.0), σ = Float32(1.0)),
     kₙ::Integer = 3)
 
     (model, model_Δ) = initModel(model_params, X, y)    
@@ -386,6 +392,7 @@ function train_fold(X::SparseMatrixCSC, y::Vector{Float64};
     kfds = kfolds(1:X.m, k = kₙ)
     for fd in 1:kₙ
         X_train, X_valid, y_train, y_valid = X[kfds[fd][1], :], X[kfds[fd][2], :], y[kfds[fd][1]], X[kfds[fd][2]]
+        #X_train, X_valid, y_train, y_valid = X, X, y, y
         for epoch in 1:method.num_epochs
             @show "[SGD - Epoch $epoch] Start..."
             cross_terms = X_train * predictor.model.V
@@ -414,9 +421,12 @@ train(X, y)=#
 
 #X, y = read_libsvm("C:/Users/user/OneDrive/Documents/languages/Julia/jl/FM/df_fm_n101847.libsvm", :row)
 @pyimport pickle
-f = py"""open("data/df_fm_csr.pickle", "rb")"""
+f = py"""open("C:/Users/user/OneDrive/Documents/languages/Julia/jl/FM/df_fm_csr.pickle", "rb")"""
 data = pickle.load(f, encoding = "latin1")
 w = sparse(data.nonzero()[1].+1, data.nonzero()[2].+1, data.data)
 X = hcat(w[:, 1:11], w[:, 13:end])
-y = Vector{Float64}(w[:, 12])
+y = Vector{Float32}(w[:, 12])
+X = hcat(X, X); X = hcat(X, X); X = hcat(X, X); X = hcat(X, X)
+X = vcat(X, X); X = vcat(X, X); X = vcat(X, X); X = vcat(X, X)
+y = vcat(y, y); y = vcat(y, y); y = vcat(y, y); y = vcat(y, y)
 train_fold(X, y)
